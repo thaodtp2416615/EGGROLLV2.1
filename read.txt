@@ -1,0 +1,46 @@
+Có — **các tham số bạn đang log hiện tại đủ để “kiểm soát sức khoẻ” của finetune ở mức vận hành** (stability/step-size/signal/noise/throughput). Nhưng để “kiểm soát chất lượng dịch” (không reward-hack, không overfit) thì **bạn cần thêm 2–3 log nữa** (mình nêu ở cuối).
+
+**1) Bạn kiểm soát được gì với các log hiện có?**
+
+- **Có tín hiệu học hay không (signal-to-noise)**  
+  Dựa vào `std_fitness` (train) và cảnh báo “fitness variance = 0”.
+  - `std_fitness ~ 0` kéo dài ⇒ ES gần như không có gradient hữu ích.  
+    Hành động: tăng `sigma` hoặc tăng `prompts_per_epoch` (đa dạng hơn), hoặc đổi reward metric/đặt decode bớt “deterministic” nếu đang quá giống nhau.
+
+- **Step size có đang quá lớn/nhỏ không (update stability)**  
+  Dựa vào `lora_param_diff`, `full_param_diff`, `gradient_norm`.
+  - `lora_param_diff`/`full_param_diff` tăng mạnh đột ngột + `gradient_norm` lớn ⇒ update “giật”, dễ làm BLEU tăng rồi sập.  
+    Hành động: giảm `lr_scale` trước, hoặc giảm `sigma`, hoặc tăng population (N) để giảm variance.
+  - `lora_param_diff` gần 0 dài + `gradient_norm` nhỏ ⇒ update quá yếu.  
+    Hành động: tăng `lr_scale` hoặc tăng `sigma` (nhỏ bước), hoặc tăng `rank` nếu LoRA-only.
+
+- **Throughput và bottleneck**  
+  Dựa vào `generation_time`, `fitness_time`, `update_time`, `total_time`.
+  - Nếu `generation_time` chiếm gần hết ⇒ tối ưu decode/batching/max_new_tokens trước, ES khó “tăng speed” bằng tối ưu update.
+
+- **Theo dõi drift theo thời gian**  
+  `true_train_avg_fitness` giúp nhìn trend dài hạn (nhưng chủ yếu là train-reward, chưa nói lên generalization).
+
+**2) Các dấu hiệu “đèn đỏ” và cách xử lý nhanh**
+
+- **Reward tăng nhưng validation giảm** (hoặc BLEU/COMET valid đi xuống)  
+  ⇒ thường là reward-hacking/overfit/prompt bias.  
+  Hành động: dựa vào valid để dừng/rollback, giảm `lr_scale`, tăng diversity prompts, và log thêm length stats (xem mục 3).
+
+- **Std fitness thấp kéo dài**  
+  ⇒ không phân biệt được member nào tốt hơn.  
+  Hành động: tăng `sigma` (để tạo khác biệt), tăng batch prompts, hoặc đổi shaping/reward.
+
+- **Param diff bùng nổ hoặc gradient_norm bùng nổ**  
+  ⇒ update quá lớn.  
+  Hành động: giảm `lr_scale` (tác động trực tiếp nhất), sau đó giảm `sigma`.
+
+**3) Những log còn thiếu để “kiểm soát chất lượng” tốt hơn**
+Nếu chỉ nhìn các log hiện có, bạn kiểm soát được stability nhưng **khó bắt reward hacking**. Nên thêm tối thiểu:
+
+- **Validation metric đúng nghĩa (BLEU/COMET) chạy ổn định**  
+  (Hiện tại `_validate()` của bạn có nguy cơ gọi sai signature khi metric != comet.)
+- **Shaped fitness mean/std** (sau shaping): biết shaping có làm scale quá nhỏ/quá lớn.
+- **Output length stats**: avg hyp length, length ratio, % empty/degenerate outputs (dịch rất hay “hack” bằng dài/ngắn/bỏ trống).
+
+Kết luận: với `avg/std/max/min fitness` + `gradient_norm` + `param_diff` + timing, bạn **kiểm soát tốt trạng thái finetuning (ổn định/step size/có tín hiệu hay không)**. Để kiểm soát “đúng hướng chất lượng dịch”, bạn cần valid metric + length/degeneracy logs (và fix validation nếu đang dùng BLEU). Nếu bạn muốn mình sửa `_validate()` và thêm mấy log tối thiểu đó vào code luôn, nói mình ưu tiên metric nào (BLEU hay COMET).

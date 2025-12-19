@@ -132,6 +132,15 @@ class TrainingStats:
     lora_param_diff: float = 0.0
     full_param_diff: float = 0.0
     gradient_norm: float = 0.0
+
+    # Shaped fitness (after fitness shaping)
+    shaped_avg_fitness: float = 0.0
+    shaped_std_fitness: float = 0.0
+
+    # Output diagnostics (helps detect reward hacking / collapse)
+    output_len_avg: float = 0.0
+    output_len_std: float = 0.0
+    output_empty_rate: float = 0.0
     
     # Timing
     prompt_time: float = 0.0
@@ -850,6 +859,8 @@ Training:
         batch_hypotheses: List[str] = []
         batch_references: List[str] = []
         batch_sources: List[str] = []
+        output_lens: List[int] = []
+        output_empty = 0
 
         for prompt_idx, (source, reference) in enumerate(tqdm(epoch_samples, desc=f"Prompts (Step {step_idx})", leave=False)):
             inputs = self.tokenizer(
@@ -874,6 +885,13 @@ Training:
                 batch_references.append(reference)
                 batch_sources.append(source)
 
+                if hypothesis.strip():
+                    # Use word count as a cheap, stable length proxy.
+                    output_lens.append(len(hypothesis.split()))
+                else:
+                    output_empty += 1
+                    output_lens.append(0)
+
         stats.generation_time = time.time() - gen_start
 
         # Compute rewards (Step 4)
@@ -891,9 +909,18 @@ Training:
         stats.max_fitness = float(np.max(raw_rewards))
         stats.min_fitness = float(np.min(raw_rewards))
         stats.median_fitness = float(np.median(raw_rewards))
+
+        # Output diagnostics
+        if len(output_lens) > 0:
+            stats.output_len_avg = float(np.mean(output_lens))
+            stats.output_len_std = float(np.std(output_lens))
+            stats.output_empty_rate = float(output_empty) / float(len(output_lens))
         
         # Shape fitnesses (Step 5a)
         shaped_fitnesses = self._shape_fitnesses(raw_rewards)
+
+        stats.shaped_avg_fitness = float(np.mean(shaped_fitnesses))
+        stats.shaped_std_fitness = float(np.std(shaped_fitnesses))
         
         # Estimate gradients and update (Steps 5b & 6)
         update_start = time.time()
@@ -956,8 +983,8 @@ Training:
             for output_ids in batch_output_ids
         ]
 
-        reward = self.reward_function(sources, hypothesis, references)
-        return reward.mean()
+        rewards = self._compute_rewards(sources, hypothesis, references)
+        return float(np.mean(rewards))
     
     # ========================================================================
     # Checkpointing
@@ -1036,11 +1063,16 @@ Training:
         """Log epoch statistics."""
         # Console logging
         if stats.epoch % self.config.log_every == 0:
-            print(f"\nEpoch {stats.epoch:5d} | "
-                  f"Fitness: {stats.avg_fitness:.4f} ± {stats.std_fitness:.4f} | "
-                  f"Best: {stats.max_fitness:.4f} | "
-                  f"Grad: {stats.gradient_norm:.6f} | "
-                  f"Time: {stats.total_time:.2f}s")
+            print(
+                f"\nStep {stats.epoch:6d} | "
+                f"RawFit: {stats.avg_fitness:.4f}±{stats.std_fitness:.4f} "
+                f"(min {stats.min_fitness:.4f}, max {stats.max_fitness:.4f}) | "
+                f"Shaped: {stats.shaped_avg_fitness:.4f}±{stats.shaped_std_fitness:.4f} | "
+                f"Len(w): {stats.output_len_avg:.1f}±{stats.output_len_std:.1f}, empty {stats.output_empty_rate:.2%} | "
+                f"ΔLoRA: {stats.lora_param_diff:.6f} ΔFull: {stats.full_param_diff:.6f} | "
+                f"Grad: {stats.gradient_norm:.6f} | "
+                f"Time: {stats.total_time:.2f}s"
+            )
             
             if stats.validation_score is not None:
                 print(f"           | Validation: {stats.validation_score:.4f} "
@@ -1092,10 +1124,9 @@ Training:
                     # Gọi hàm train step (đã sửa ở Bước 2)
                     # Truyền global_step để sinh noise khác nhau cho mỗi batch
                     stats = self._train_step(batch_data, global_step)
-                    
-                    # Log mỗi bước (hoặc mỗi N bước)
-                    if global_step % self.config.log_every == 0:
-                        print(f" Step {global_step} | Fitness: {stats.avg_fitness:.4f} | Loss/Diff: {stats.lora_param_diff:.6f}")
+
+                    # Unified logging
+                    self._log_epoch(stats)
                     
                     
                     if global_step > 0 and global_step % self.config.save_every == 0:

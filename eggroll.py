@@ -21,9 +21,7 @@ import sys
 import csv
 import time
 import math
-import copy
 import operator
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, field, asdict
@@ -81,7 +79,6 @@ class EggrollTrainerConfig:
     # Population settings
     generations_per_prompt: int = 8  # N: population size per unique prompt
     prompts_per_epoch: int = 8       # Number of unique prompts per epoch
-    num_workers: int = 32            # Increased workers for A100 (utilize 40GB VRAM)
     
     # Training settings
     num_epochs: int = 50
@@ -101,7 +98,9 @@ class EggrollTrainerConfig:
     
     # Reward settings
     reward_metric: str = "bleu"      # "bleu", "meteor", "chrf", "composite"
-    fitness_shaping: str = "centered_rank"  # "none", "standardize", "centered_rank"
+    # Matches HyperscaleES EggRoll.convert_fitnesses by default
+    # Options: "none", "standardize", "centered_rank", "hyperscalees"
+    fitness_shaping: str = "hyperscalees"
     
     # Device settings
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -229,7 +228,6 @@ class EggrollTrainer:
         
         # Initialize components (will be set in setup())
         self.model = None
-        self.workers = []  # List of model replicas
         self.tokenizer = None
         self.params = None
         self.es_map = None
@@ -276,10 +274,6 @@ class EggrollTrainer:
         print("\n[1/6] Loading model and tokenizer...")
         self._load_model()
         
-        # 1b. Initialize workers
-        print(f"\n[1b/6] Initializing {self.config.num_workers} parallel workers...")
-        self._init_workers()
-        
         # 2. Extract parameters and build ES map
         print("\n[2/6] Building ES parameter map...")
         self._build_es_map()
@@ -318,12 +312,11 @@ class EggrollTrainer:
 
         # [NEW] Compile model để tối ưu hóa tốc độ trên A100
         # mode="reduce-overhead" rất tốt cho trường hợp loop nhiều như ES
-        # NOTE: Disabling torch.compile for now as it may cause issues with deepcopy/threading
-        # try:
-        #     self.model = torch.compile(self.model, mode="reduce-overhead")
-        #     print("  Model compiled with torch.compile!")
-        # except Exception as e:
-        #     print(f"  Could not compile model: {e}")
+        try:
+            self.model = torch.compile(self.model, mode="reduce-overhead")
+            print("  Model compiled with torch.compile!")
+        except Exception as e:
+            print(f"  Could not compile model: {e}")
         
         # Extract parameters
         self.params = {
@@ -333,18 +326,6 @@ class EggrollTrainer:
         
         print(f"  Model: {self.model.__class__.__name__}")
         print(f"  Parameters: {sum(p.numel() for p in self.model.parameters()):,}")
-
-    def _init_workers(self):
-        """Initialize parallel model replicas."""
-        self.workers = []
-        # Create replicas
-        for i in range(self.config.num_workers):
-            print(f"  Creating worker {i+1}/{self.config.num_workers}...")
-            # Deepcopy model structure
-            worker = copy.deepcopy(self.model)
-            worker.eval()
-            self.workers.append(worker)
-        print("  Workers initialized.")
         
     def _build_es_map(self):
         """Build ES parameter classification map."""
@@ -487,102 +468,92 @@ Training:
     # Step 2 & 3: Perturbation and Forward Pass
     # ========================================================================
     
-    def _get_perturbation_seed(self, base_seed: int, epoch: int, member_idx: int) -> int:
+    def _get_perturbation_seed(self, base_seed: int, epoch: int, thread_id: int) -> int:
         """
-        [MODIFIED for Antithetic Sampling]
-        Returns seed based on PAIR index, not member index.
-        Members 0 and 1 will share the same seed.
+        Matches HyperscaleES seeding: fold in (true_epoch, true_thread_idx)
+        where true_thread_idx = thread_id // 2 and true_epoch is controlled by noise_reuse.
         """
-        # Chia đôi index để lấy pair_idx (0, 1 -> 0; 2, 3 -> 1...)
-        pair_idx = member_idx // 2
-        
-        if self.config.noise_reuse > 0:
-            effective_epoch = epoch // self.config.noise_reuse
+        true_thread_idx = thread_id // 2
+
+        # HyperscaleES: true_epoch = 0 if noise_reuse == 0 else epoch // noise_reuse
+        if self.config.noise_reuse == 0:
+            true_epoch = 0
         else:
-            effective_epoch = epoch
-            
-        # Dùng pair_idx để sinh seed
-        return ((base_seed * 31337) + effective_epoch * 1000 + pair_idx) % (2**31)
+            true_epoch = epoch // self.config.noise_reuse
+
+        return ((base_seed * 31337) + true_epoch * 1000 + true_thread_idx) % (2**31)
 
     def _generate_lora_perturbation(
         self,
         param_shape: Tuple[int, int],
         seed: int,
+        sigma_signed: float,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Generate low-rank perturbation matrices A and B.
-        Optimized to create directly on device if possible (optional),
-        but keeping CPU generator for reproducibility is safer.
+
+        Matches HyperscaleES get_lora_update_params + callers:
+        - Sample a single (a+b, r) matrix with one seed, then split into B (b, r) and A (a, r)
+        - Scale A by (sigma_signed / sqrt(rank)); B is unscaled.
         """
         out_features, in_features = param_shape
         rank = self.config.rank
-        sigma = self.config.sigma
 
-        # Generator trên CPU để đảm bảo tính tái lập (reproducibility) 
-        # bất kể chạy trên GPU nào.
-        gen_A = torch.Generator().manual_seed(seed)
-        gen_B = torch.Generator().manual_seed(seed + 1)
+        # CPU generator for reproducibility across CUDA devices.
+        gen = torch.Generator(device="cpu").manual_seed(seed)
 
-        scale = sigma / math.sqrt(rank)
+        # HyperscaleES uses (a+b, r) where param.shape == (a, b)
+        lora_params = torch.randn((out_features + in_features, rank), generator=gen, dtype=torch.float32)
+        B = lora_params[:in_features]      # (b, r)
+        A = lora_params[in_features:]      # (a, r)
 
-        # Tạo trên CPU rồi chuyển sang GPU
-        A = torch.randn(out_features, rank, generator=gen_A) * scale
-        B = torch.randn(in_features, rank, generator=gen_B)
-
+        A = A * (sigma_signed / math.sqrt(rank))
         return A.to(self.device), B.to(self.device)
     @torch.no_grad()
     def _generate_with_perturbation(
         self,
-        model: nn.Module,
         input_ids: torch.Tensor,
         epoch: int,
-        member_idx: int,
+        thread_id: int,
     ) -> torch.Tensor:
         """
-        [MODIFIED for Antithetic Sampling + In-place Optimization]
+        Apply a single HyperscaleES-style perturbation (thread) to weights, generate, then restore.
+
+        Important: thread_id is global across all parallel generations; antithetic sign is thread_id % 2.
         """
-        # Xác định chiều hướng: Chẵn (+) | Lẻ (-)
-        # direction = 1.0 nếu member_idx chẵn
-        # direction = -1.0 nếu member_idx lẻ
-        direction = 1.0 if (member_idx % 2 == 0) else -1.0
+        sigma_signed = self.config.sigma if (thread_id % 2 == 0) else -self.config.sigma
         
         noise_cache = {} 
 
         # 1. APPLY NOISE
-        for name, param in model.named_parameters():
+        for name, param in self.model.named_parameters():
             map_type = self.es_map.get(name, ESMapType.FROZEN)
             if map_type == ESMapType.FROZEN:
                 continue
 
             # Lấy seed (đã sửa ở Bước 1 để trả về seed chung cho cặp)
             base_seed = self.base_evo_keys[name].seed
-            seed = self._get_perturbation_seed(base_seed, epoch, member_idx)
+            seed = self._get_perturbation_seed(base_seed, epoch, thread_id)
 
             if map_type == ESMapType.LORA and len(param.shape) == 2:
-                # Sinh nhiễu cơ sở
-                A, B = self._generate_lora_perturbation(param.shape, seed)
-                
-                # [OPTIMIZED] Sử dụng addmm_ để tránh tạo ma trận trung gian delta_w (m x n)
-                # param = param + alpha * (A @ B.T)
-                alpha = 1.0 if direction > 0 else -1.0
-                param.data.addmm_(A, B.T, alpha=alpha)
+                A, B = self._generate_lora_perturbation(param.shape, seed, sigma_signed)
+                delta_w = A @ B.T
+
+                param.data.add_(delta_w)
                 
                 noise_cache[name] = (A, B)
                 
             elif map_type == ESMapType.FULL:
-                gen = torch.Generator().manual_seed(seed)
-                noise = torch.randn_like(param, generator=gen) * self.config.sigma
-                noise = noise.to(self.device)
-                
-                if direction > 0:
-                    param.data.add_(noise)
-                else:
-                    param.data.sub_(noise)
+                # HyperscaleES: updates = eps * sigma_signed
+                gen = torch.Generator(device="cpu").manual_seed(seed)
+                eps = torch.randn(param.shape, generator=gen, dtype=torch.float32)
+                noise = (eps.to(device=self.device, dtype=param.dtype) * sigma_signed)
+                param.data.add_(noise)
                     
                 noise_cache[name] = noise
 
         # 2. GENERATE
-        output_ids = model.generate(
+        output_ids = self.model.generate(
             input_ids=input_ids,
             num_beams=self.config.num_beams,
             max_new_tokens=128,
@@ -590,22 +561,16 @@ Training:
         )
 
         # 3. RESTORE WEIGHTS (Đảo ngược thao tác trên)
-        for name, param in model.named_parameters():
+        for name, param in self.model.named_parameters():
             if name in noise_cache:
                 if self.es_map[name] == ESMapType.LORA:
                     A, B = noise_cache[name]
-                    
-                    # [OPTIMIZED] Đảo ngược thao tác: trừ nếu đã cộng, cộng nếu đã trừ
-                    # alpha ngược dấu với lúc apply
-                    alpha = -1.0 if direction > 0 else 1.0
-                    param.data.addmm_(A, B.T, alpha=alpha)
+                    delta_w = A @ B.T
 
+                    param.data.sub_(delta_w)
                 else:
                     noise = noise_cache[name]
-                    if direction > 0:
-                        param.data.sub_(noise)
-                    else:
-                        param.data.add_(noise)
+                    param.data.sub_(noise)
         
         del noise_cache
         return output_ids
@@ -693,7 +658,7 @@ Training:
         """
         Apply fitness shaping for ES stability.
         
-        Mirrors NOISER.convert_fitnesses from original code.
+        Matches HyperscaleES EggRoll.convert_fitnesses.
         """
         if self.config.fitness_shaping == "none":
             return raw_scores
@@ -708,20 +673,25 @@ Training:
             ranks = np.argsort(np.argsort(raw_scores))
             shaped = (ranks.astype(np.float32) + 0.5) / n - 0.5
             return shaped
-            
+
+        elif self.config.fitness_shaping == "hyperscalees":
+            group_size = int(self.config.generations_per_prompt)
+            denom = math.sqrt(float(np.var(raw_scores, keepdims=True)) + 1e-5)
+            if group_size == 0:
+                mean = float(np.mean(raw_scores, keepdims=True))
+                return (raw_scores - mean) / denom
+
+            if raw_scores.ndim != 1:
+                raise ValueError("hyperscalees fitness_shaping expects 1D raw_scores")
+            if raw_scores.size % group_size != 0:
+                raise ValueError("raw_scores.size must be divisible by generations_per_prompt")
+            group_scores = raw_scores.reshape((-1, group_size))
+            group_mean = np.mean(group_scores, axis=-1, keepdims=True)
+            true_scores = (group_scores - group_mean) / denom
+            return true_scores.ravel()
+
         else:
-            # Group-wise normalization (for multiple prompts)
-            group_size = self.config.generations_per_prompt
-            if group_size > 0 and len(raw_scores) > group_size:
-                group_scores = raw_scores.reshape(-1, group_size)
-                group_mean = np.mean(group_scores, axis=-1, keepdims=True)
-                global_std = np.std(raw_scores) + 1e-8
-                shaped = (group_scores - group_mean) / global_std
-                return shaped.ravel()
-            else:
-                mean = np.mean(raw_scores)
-                std = np.std(raw_scores) + 1e-8
-                return (raw_scores - mean) / std
+            raise ValueError(f"Unknown fitness_shaping: {self.config.fitness_shaping}")
     
     # ========================================================================
     # Steps 5 & 6: Gradient Estimation and Update
@@ -733,14 +703,18 @@ Training:
         epoch: int,
     ) -> Dict[str, float]:
         """
-        [MODIFIED for Antithetic Sampling]
-        Correctly handles gradient estimation with mirrored pairs.
+        Matches HyperscaleES EggRoll._do_update semantics:
+        - new_grad = mean(scores * updates)
+        - returned grad to optimizer = -(new_grad * sqrt(N))
         """
         population_size = len(shaped_fitnesses)
         
         # Kiểm tra sanity check
         if population_size % 2 != 0:
-            raise ValueError("Population size (generations_per_prompt) must be EVEN for antithetic sampling.")
+            raise ValueError("Total parallel generations must be EVEN for antithetic sampling.")
+
+        if self.config.sigma <= 0:
+            raise ValueError("sigma must be > 0 for ES gradient estimation")
 
         stats = {}
         new_params = {}
@@ -757,42 +731,32 @@ Training:
                 new_params[name] = param
                 continue
 
-            # Estimate gradient
-            gradient = torch.zeros_like(param)
-            
-            # Scale chuẩn (như đã fix ở câu trả lời trước)
-            lora_scale = self.config.sigma / math.sqrt(self.config.rank)
+            # new_grad in HyperscaleES (pre -sqrt(N) scaling)
+            new_grad = torch.zeros_like(param)
 
-            for member_idx in range(population_size):
-                R_i = shaped_fitnesses[member_idx]
-                
-                # 1. Xác định hướng (Quan trọng)
-                direction = 1.0 if (member_idx % 2 == 0) else -1.0
-                
-                # 2. Lấy seed (chung cho cặp)
-                base_seed = self.base_evo_keys[name].seed
-                seed = self._get_perturbation_seed(base_seed, epoch, member_idx)
+            sqrt_n = math.sqrt(population_size)
+
+            base_seed = self.base_evo_keys[name].seed
+            for thread_id in range(population_size):
+                score = float(shaped_fitnesses[thread_id])
+                sigma_signed = self.config.sigma if (thread_id % 2 == 0) else -self.config.sigma
+                seed = self._get_perturbation_seed(base_seed, epoch, thread_id)
 
                 if map_type == ESMapType.LORA and len(param.shape) == 2:
-                    A, B = self._generate_lora_perturbation(param.shape, seed)
-                    
-                    # Gradient contribution = Reward * Direction * Noise / Scale
-                    # [OPTIMIZED] Sử dụng addmm_ để tiết kiệm bộ nhớ và tính toán
-                    # gradient += alpha * (A @ B.T)
-                    
-                    alpha = (R_i * direction / lora_scale)
-                    gradient.addmm_(A, B.T, alpha=alpha)
-                    
+                    A, B = self._generate_lora_perturbation(param.shape, seed, sigma_signed)
+                    new_grad += (score * (A @ B.T))
+
                 elif map_type == ESMapType.FULL:
-                    gen = torch.Generator().manual_seed(seed)
-                    noise = torch.randn_like(param, generator=gen) * self.config.sigma
-                    
-                    gradient += (R_i * direction / self.config.sigma) * noise.to(self.device)
+                    gen = torch.Generator(device="cpu").manual_seed(seed)
+                    eps = torch.randn(param.shape, generator=gen, dtype=torch.float32)
+                    updates = eps.to(device=self.device, dtype=param.dtype) * sigma_signed
+                    new_grad += (score * updates)
 
-            gradient /= population_size
+            new_grad /= population_size
 
-            # ... (Phần còn lại giữ nguyên: Optimizer, Update, Stats) ...
-            update = self._apply_optimizer_step(name, gradient)
+            # grad passed into optimizer matches HyperscaleES return value
+            grad_for_opt = -(new_grad * sqrt_n)
+            update = self._apply_optimizer_step(name, grad_for_opt)
             new_param = param + update
             new_params[name] = new_param
             
@@ -803,7 +767,7 @@ Training:
             else:
                 full_diff_sum += diff
                 full_count += 1
-            total_grad_norm_sq += torch.norm(gradient).item() ** 2
+            total_grad_norm_sq += torch.norm(grad_for_opt).item() ** 2
 
         self.params = new_params
         self._update_model_weights()
@@ -817,7 +781,7 @@ Training:
         name: str,
         gradient: torch.Tensor,
     ) -> torch.Tensor:
-        """Apply optimizer step to gradient."""
+        """Apply an Optax-like optimizer step (returns the *update* to be added to params)."""
         lr = self.config.lr_scale
         
         if self.config.optimizer_type == "adam":
@@ -838,16 +802,16 @@ Training:
             m_hat = m / (1 - beta1 ** t)
             v_hat = v / (1 - beta2 ** t)
             
-            return lr * m_hat / (torch.sqrt(v_hat) + eps)
+            return -lr * m_hat / (torch.sqrt(v_hat) + eps)
             
         elif self.config.momentum > 0:
             m = self.opt_state.momentum.get(name, torch.zeros_like(gradient))
             m = self.config.momentum * m + gradient
             self.opt_state.momentum[name] = m
-            return lr * m
+            return -lr * m
             
         else:
-            return lr * gradient
+            return -lr * gradient
     
     def _update_model_weights(self):
         """Update model weights from params dictionary."""
@@ -880,100 +844,50 @@ Training:
         epoch_samples = batch_data
         
         # Generate with all population members
+        # Matches HyperscaleES: each (prompt_idx, member_idx) is a distinct ES thread.
         gen_start = time.time()
 
-        all_references = [reference for _, reference in epoch_samples]
-        all_sources = [source for source, _ in epoch_samples]
-        
-        batch_inputs = self.tokenizer(
-            all_sources,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=128,
-        ).to(self.device)
+        batch_hypotheses: List[str] = []
+        batch_references: List[str] = []
+        batch_sources: List[str] = []
 
-        # Generate for each population member
-        batch_hypotheses = [None] * self.config.generations_per_prompt
-        batch_references = []
-        batch_sources = []
-        
-        # Sync workers with current model weights
-        current_state_dict = self.model.state_dict()
-        for worker in self.workers:
-            worker.load_state_dict(current_state_dict)
+        for prompt_idx, (source, reference) in enumerate(tqdm(epoch_samples, desc=f"Prompts (Step {step_idx})", leave=False)):
+            inputs = self.tokenizer(
+                [source],
+                return_tensors="pt",
+                padding=False,
+                truncation=True,
+                max_length=128,
+            ).to(self.device)
 
-        # Helper function for parallel execution
-        def process_member(args):
-            member_idx, worker_idx = args
-            worker_model = self.workers[worker_idx]
-            
-            # Create a separate CUDA stream for this worker to allow kernel concurrency
-            stream = torch.cuda.Stream()
-            with torch.cuda.stream(stream):
-                # Generate
+            for member_idx in range(self.config.generations_per_prompt):
+                thread_id = (prompt_idx * self.config.generations_per_prompt) + member_idx
                 output_ids = self._generate_with_perturbation(
-                    worker_model,
-                    batch_inputs["input_ids"],
+                    inputs["input_ids"],
                     step_idx,
-                    member_idx,
+                    thread_id,
                 )
-            
-            # Wait for stream to finish before decoding (decoding is CPU)
-            stream.synchronize()
-            
-            # Decode
-            hyps = [
-                self.tokenizer.decode(ids, skip_special_tokens=True)
-                for ids in output_ids
-            ]
-            return member_idx, hyps
 
-        # Prepare tasks
-        tasks = []
-        for i in range(self.config.generations_per_prompt):
-            worker_idx = i % self.config.num_workers
-            tasks.append((i, worker_idx))
+                # output_ids has shape (1, seq_len)
+                hypothesis = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
+                batch_hypotheses.append(hypothesis)
+                batch_references.append(reference)
+                batch_sources.append(source)
 
-        # Execute in parallel
-        with ThreadPoolExecutor(max_workers=self.config.num_workers) as executor:
-            results = list(tqdm(
-                executor.map(process_member, tasks),
-                total=len(tasks),
-                desc=f"Generating (Step {step_idx})",
-                leave=False
-            ))
-
-        # Collect results
-        for member_idx, hyps in results:
-            batch_hypotheses[member_idx] = hyps
-            
-        # Flatten batch_hypotheses (currently list of lists)
-        # We need to align with references/sources repeated for each member
-        flat_hypotheses = []
-        for hyps in batch_hypotheses:
-            flat_hypotheses.extend(hyps)
-            batch_references.extend(all_references)
-            batch_sources.extend(all_sources)
-            
-        batch_hypotheses = flat_hypotheses
-                
         stats.generation_time = time.time() - gen_start
-        
+
         # Compute rewards (Step 4)
         fitness_start = time.time()
         raw_rewards = self._compute_rewards(batch_sources, batch_hypotheses, batch_references)
-        
-        # Aggregate rewards per direction
-        raw_rewards = raw_rewards.reshape(
-            self.config.generations_per_prompt,
-            self.config.prompts_per_epoch,
-        ).sum(axis=1)
         
         stats.fitness_time = time.time() - fitness_start
         # Statistics
         stats.avg_fitness = float(np.mean(raw_rewards))
         stats.std_fitness = float(np.std(raw_rewards))
+        
+        if stats.std_fitness < 1e-9:
+            print(f"  [WARNING] Fitness variance is 0. All rewards are identical! -> Increase Sigma or Batch Size.")
+
         stats.max_fitness = float(np.max(raw_rewards))
         stats.min_fitness = float(np.min(raw_rewards))
         stats.median_fitness = float(np.median(raw_rewards))
@@ -994,11 +908,8 @@ Training:
         self.opt_state.step += 1
         
         # Update running average
-        self.true_train_fitness_sum += np.sum(raw_rewards)
-        stats.true_train_avg_fitness = (
-            self.true_train_fitness_sum / 
-            ((step_idx + 1) * self.config.generations_per_prompt)
-        )
+        self.true_train_fitness_sum += float(np.sum(raw_rewards))
+        stats.true_train_avg_fitness = self.true_train_fitness_sum / ((step_idx + 1) * raw_rewards.size)
         
             
         stats.total_time = time.time() - step_start
@@ -1235,13 +1146,13 @@ def main():
         model_name="/home/jovyan/nmt-srv-shared/users/binh/grpo_training/transflow/0_Base/en-vi-2.1.10.04-grpo-100k",
         
         # EGGROLL hyperparameters
-        sigma=0.02,
-        lr_scale=0.005,
-        rank=64,
+        sigma=0.01,                  # [USER CONFIG]
+        lr_scale=0.001,              # [USER CONFIG]
+        rank=32,                     # [USER CONFIG]
         
         # Population
         generations_per_prompt=128,
-        prompts_per_epoch=64,
+        prompts_per_epoch=1024,      # [USER CONFIG]
         
         # Training
         num_epochs=50,
@@ -1250,11 +1161,12 @@ def main():
         log_every=1,
         
         # Optimizer
-        optimizer_type="adam",
+        optimizer_type="sgd",
+        momentum=0.9,
         
         # Reward
         reward_metric="bleu",
-        fitness_shaping="centered_rank",
+        fitness_shaping="hyperscalees",
         
         # Paths
         save_path="/home/jovyan/nmt-srv-shared/users/binh/EGGROLL/checkpointsv2",
